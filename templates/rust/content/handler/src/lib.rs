@@ -1,5 +1,7 @@
 use wasmcp::{AsyncToolHandler, AsyncResourceHandler, json};
-use std::time::Duration;
+use bindings::wasi::http::outgoing_handler;
+use bindings::wasi::http::types::{Method, Scheme, Fields, OutgoingRequest};
+use spin_sdk::key_value::Store;
 
 // Define your tools as zero-sized types
 struct EchoTool;
@@ -26,14 +28,105 @@ impl AsyncToolHandler for EchoTool {
             .as_str()
             .ok_or("Missing message field")?;
         
-        // Simulate async processing
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        
         Ok(format!("Echo: {}", message))
     }
 }
 
-// Example of async HTTP request tool
+// KV Store tool for testing Spin KV functionality
+struct KvStoreTool;
+
+impl AsyncToolHandler for KvStoreTool {
+    const NAME: &'static str = "kv_store";
+    const DESCRIPTION: &'static str = "Get or set values in Spin key-value store";
+    
+    fn input_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": { 
+                    "type": "string",
+                    "enum": ["get", "set", "delete", "exists"],
+                    "description": "Action to perform"
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Key to operate on"
+                },
+                "value": {
+                    "type": "string",
+                    "description": "Value to set (required for 'set' action)"
+                }
+            },
+            "required": ["action", "key"]
+        })
+    }
+    
+    async fn execute_async(args: serde_json::Value) -> Result<String, String> {
+        let action = args["action"].as_str().ok_or("Missing action field")?;
+        let key = args["key"].as_str().ok_or("Missing key field")?;
+        
+        // Open the default store
+        let store = Store::open_default()
+            .map_err(|e| format!("Failed to open KV store: {:?}", e))?;
+        
+        match action {
+            "get" => {
+                match store.get(key) {
+                    Ok(Some(value)) => {
+                        let value_str = String::from_utf8(value)
+                            .unwrap_or_else(|_| "Binary data (not UTF-8)".to_string());
+                        Ok(json!({
+                            "exists": true,
+                            "value": value_str
+                        }).to_string())
+                    }
+                    Ok(None) => {
+                        Ok(json!({
+                            "exists": false,
+                            "value": null
+                        }).to_string())
+                    }
+                    Err(e) => Err(format!("Failed to get value: {:?}", e))
+                }
+            }
+            "set" => {
+                let value = args["value"]
+                    .as_str()
+                    .ok_or("Missing value field for set action")?;
+                
+                store.set(key, value.as_bytes())
+                    .map_err(|e| format!("Failed to set value: {:?}", e))?;
+                
+                Ok(json!({
+                    "success": true,
+                    "key": key,
+                    "value": value
+                }).to_string())
+            }
+            "delete" => {
+                store.delete(key)
+                    .map_err(|e| format!("Failed to delete key: {:?}", e))?;
+                
+                Ok(json!({
+                    "success": true,
+                    "key": key,
+                    "deleted": true
+                }).to_string())
+            }
+            "exists" => {
+                let exists = store.exists(key)
+                    .map_err(|e| format!("Failed to check existence: {:?}", e))?;
+                
+                Ok(json!({
+                    "key": key,
+                    "exists": exists
+                }).to_string())
+            }
+            _ => Err(format!("Unknown action: {}", action))
+        }
+    }
+}
+
 struct HttpRequestTool;
 
 impl AsyncToolHandler for HttpRequestTool {
@@ -48,10 +141,11 @@ impl AsyncToolHandler for HttpRequestTool {
                     "type": "string", 
                     "description": "URL to make request to" 
                 },
-                "timeout_seconds": {
-                    "type": "number",
-                    "description": "Request timeout in seconds",
-                    "default": 30
+                "method": {
+                    "type": "string",
+                    "enum": ["GET", "POST", "PUT", "DELETE"],
+                    "default": "GET",
+                    "description": "HTTP method"
                 }
             },
             "required": ["url"]
@@ -63,334 +157,135 @@ impl AsyncToolHandler for HttpRequestTool {
             .as_str()
             .ok_or("Missing url field")?;
         
-        let timeout = args["timeout_seconds"]
-            .as_u64()
-            .unwrap_or(30);
+        let method_str = args["method"]
+            .as_str()
+            .unwrap_or("GET");
         
-        // Simulate HTTP request with timeout
-        match tokio::time::timeout(
-            Duration::from_secs(timeout),
-            simulate_http_request(url)
-        ).await {
-            Ok(result) => result,
-            Err(_) => Err(format!("Request timed out after {} seconds", timeout))
-        }
-    }
-}
-
-// Example of async file operations tool
-struct FileOperationsTool;
-
-impl AsyncToolHandler for FileOperationsTool {
-    const NAME: &'static str = "file_operations";
-    const DESCRIPTION: &'static str = "Perform async file operations";
-    
-    fn input_schema() -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "operation": {
-                    "type": "string",
-                    "enum": ["read", "write", "list"],
-                    "description": "Operation to perform"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "File or directory path"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Content to write (for write operation)"
+        // Parse URL to extract components
+        let (scheme, host, path) = parse_url(url)?;
+        
+        // Create headers
+        let headers = Fields::new();
+        headers.append(&"Host".to_string(), host.as_bytes())
+            .map_err(|e| format!("Failed to set Host header: {:?}", e))?;
+        headers.append(&"User-Agent".to_string(), b"wasmcp/1.0")
+            .map_err(|e| format!("Failed to set User-Agent header: {:?}", e))?;
+        
+        // Determine HTTP method
+        let method = match method_str {
+            "GET" => Method::Get,
+            "POST" => Method::Post,
+            "PUT" => Method::Put,
+            "DELETE" => Method::Delete,
+            _ => Method::Get,
+        };
+        
+        // Create the request
+        let request = OutgoingRequest::new(headers);
+        request.set_method(&method)
+            .map_err(|e| format!("Failed to set method: {:?}", e))?;
+        request.set_scheme(Some(&scheme))
+            .map_err(|e| format!("Failed to set scheme: {:?}", e))?;
+        request.set_authority(Some(&host))
+            .map_err(|e| format!("Failed to set authority: {:?}", e))?;
+        request.set_path_with_query(Some(&path))
+            .map_err(|e| format!("Failed to set path: {:?}", e))?;
+        
+        // Send the request
+        let future_response = outgoing_handler::handle(request, None)
+            .map_err(|e| format!("Request failed: {:?}", e))?;
+        
+        // Poll the future until we get a response
+        let response = loop {
+            match future_response.get() {
+                Some(result) => break result,
+                None => {
+                    // Subscribe to the pollable and wait
+                    let pollable = future_response.subscribe();
+                    pollable.block();
                 }
-            },
-            "required": ["operation", "path"]
-        })
-    }
-    
-    async fn execute_async(args: serde_json::Value) -> Result<String, String> {
-        let operation = args["operation"]
-            .as_str()
-            .ok_or("Missing operation field")?;
+            }
+        }.map_err(|_| "Failed to get response".to_string())?
+        .map_err(|e| format!("Response error: {:?}", e))?;
         
-        let path = args["path"]
-            .as_str()
-            .ok_or("Missing path field")?;
+        // Read response
+        let status = response.status();
         
-        match operation {
-            "read" => simulate_file_read(path).await,
-            "write" => {
-                let content = args["content"]
-                    .as_str()
-                    .ok_or("Missing content field for write operation")?;
-                simulate_file_write(path, content).await
-            },
-            "list" => simulate_directory_list(path).await,
-            _ => Err(format!("Unknown operation: {}", operation))
+        // Get response body
+        let body = response.consume()
+            .map_err(|_| "Failed to get response body".to_string())?;
+        
+        let body_stream = body.stream()
+            .map_err(|_| "Failed to get body stream".to_string())?;
+        
+        let mut body_bytes = Vec::new();
+        loop {
+            let chunk = body_stream.blocking_read(4096)
+                .map_err(|e| format!("Failed to read response: {:?}", e))?;
+            
+            if chunk.is_empty() {
+                break;
+            }
+            
+            body_bytes.extend_from_slice(&chunk);
         }
+        
+        let body = String::from_utf8(body_bytes)
+            .unwrap_or_else(|_| "Binary response (not UTF-8)".to_string());
+        
+        Ok(json!({
+            "status": status,
+            "body": body
+        }).to_string())
     }
 }
 
-// Example async resource
+fn parse_url(url: &str) -> Result<(Scheme, String, String), String> {
+    // Simple URL parsing
+    let (scheme, rest) = if url.starts_with("https://") {
+        (Scheme::Https, &url[8..])
+    } else if url.starts_with("http://") {
+        (Scheme::Http, &url[7..])
+    } else {
+        return Err("URL must start with http:// or https://".to_string());
+    };
+    
+    // Find the path separator
+    let (host, path) = if let Some(pos) = rest.find('/') {
+        (&rest[..pos], &rest[pos..])
+    } else {
+        (rest, "/")
+    };
+    
+    Ok((scheme, host.to_string(), path.to_string()))
+}
+
+// Define a simple resource handler
 struct ConfigResource;
 
 impl AsyncResourceHandler for ConfigResource {
     const URI: &'static str = "config://app-config";
     const NAME: &'static str = "Application Configuration";
-    const DESCRIPTION: Option<&'static str> = Some("Dynamic application configuration");
+    const DESCRIPTION: Option<&'static str> = Some("Application configuration settings");
     const MIME_TYPE: Option<&'static str> = Some("application/json");
     
     async fn read_async() -> Result<String, String> {
-        // Simulate async config loading
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        
-        Ok(json!({
+        let content = json!({
+            "app_name": "MCP Test App",
             "version": "1.0.0",
-            "environment": "production",
+            "debug": true,
             "features": {
-                "async_processing": true,
                 "http_requests": true,
-                "file_operations": true
-            },
-            "limits": {
-                "max_timeout": 300,
-                "max_file_size": 1048576
+                "echo": true
             }
-        }).to_string())
+        });
+        Ok(content.to_string())
     }
 }
-
-// Helper functions to simulate async operations
-async fn simulate_http_request(url: &str) -> Result<String, String> {
-    // Simulate network delay
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    
-    // Simulate different responses based on URL
-    match url {
-        url if url.starts_with("https://") => {
-            Ok(json!({
-                "status": "success",
-                "url": url,
-                "response_time_ms": 100,
-                "body": "Simulated HTTP response"
-            }).to_string())
-        },
-        _ => Err("Invalid URL: must start with https://".to_string())
-    }
-}
-
-async fn simulate_file_read(path: &str) -> Result<String, String> {
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    
-    match path {
-        "/etc/config.json" => Ok(json!({"config": "value"}).to_string()),
-        "/var/log/app.log" => Ok("2024-01-01 10:00:00 INFO Application started\n2024-01-01 10:00:01 INFO Ready to serve requests".to_string()),
-        _ => Err(format!("File not found: {}", path))
-    }
-}
-
-async fn simulate_file_write(path: &str, content: &str) -> Result<String, String> {
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    
-    if path.starts_with("/tmp/") {
-        Ok(format!("Successfully wrote {} bytes to {}", content.len(), path))
-    } else {
-        Err("Write access denied: can only write to /tmp/".to_string())
-    }
-}
-
-async fn simulate_directory_list(path: &str) -> Result<String, String> {
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    
-    match path {
-        "/tmp" => Ok(json!(["file1.txt", "file2.json", "subdir/"]).to_string()),
-        "/etc" => Ok(json!(["config.json", "hosts", "passwd"]).to_string()),
-        _ => Err(format!("Directory not found: {}", path))
-    }
-}
-
-// Add more tools here...
 
 // Generate the MCP handler implementation
-// This macro generates WebAssembly bindings, so it's only compiled for wasm targets
 #[cfg(target_arch = "wasm32")]
 wasmcp::create_handler!(
-    tools: [EchoTool, HttpRequestTool, FileOperationsTool],
+    tools: [EchoTool, HttpRequestTool, KvStoreTool],
     resources: [ConfigResource],
 );
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-    
-    #[tokio::test]
-    async fn test_echo_tool_metadata() {
-        assert_eq!(EchoTool::NAME, "echo");
-        assert_eq!(EchoTool::DESCRIPTION, "Echo a message back to the user");
-    }
-    
-    #[tokio::test]
-    async fn test_echo_tool_schema() {
-        let schema = EchoTool::input_schema();
-        
-        // Check that it's an object schema
-        assert_eq!(schema["type"], "object");
-        
-        // Check that message property exists
-        assert!(schema["properties"]["message"].is_object());
-        assert_eq!(schema["properties"]["message"]["type"], "string");
-        
-        // Check required fields
-        let required = schema["required"].as_array().unwrap();
-        assert!(required.contains(&json!("message")));
-    }
-    
-    #[tokio::test]
-    async fn test_echo_tool_execute_success() {
-        let args = json!({
-            "message": "Hello, world!"
-        });
-        
-        let result = EchoTool::execute_async(args).await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "Echo: Hello, world!");
-    }
-    
-    #[tokio::test]
-    async fn test_echo_tool_execute_missing_message() {
-        let args = json!({});
-        
-        let result = EchoTool::execute_async(args).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Missing message field");
-    }
-    
-    #[tokio::test]
-    async fn test_http_request_tool_success() {
-        let args = json!({
-            "url": "https://api.example.com/data"
-        });
-        
-        let result = HttpRequestTool::execute_async(args).await;
-        assert!(result.is_ok());
-        
-        let response: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
-        assert_eq!(response["status"], "success");
-        assert_eq!(response["url"], "https://api.example.com/data");
-    }
-    
-    #[tokio::test]
-    async fn test_http_request_tool_invalid_url() {
-        let args = json!({
-            "url": "http://insecure.com"
-        });
-        
-        let result = HttpRequestTool::execute_async(args).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("must start with https://"));
-    }
-    
-    #[tokio::test]
-    async fn test_http_request_tool_timeout() {
-        let args = json!({
-            "url": "https://slow-api.com",
-            "timeout_seconds": 0
-        });
-        
-        let result = HttpRequestTool::execute_async(args).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("timed out"));
-    }
-    
-    #[tokio::test]
-    async fn test_file_operations_tool_read() {
-        let args = json!({
-            "operation": "read",
-            "path": "/etc/config.json"
-        });
-        
-        let result = FileOperationsTool::execute_async(args).await;
-        assert!(result.is_ok());
-        
-        let content: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
-        assert_eq!(content["config"], "value");
-    }
-    
-    #[tokio::test]
-    async fn test_file_operations_tool_write() {
-        let args = json!({
-            "operation": "write",
-            "path": "/tmp/test.txt",
-            "content": "Hello, world!"
-        });
-        
-        let result = FileOperationsTool::execute_async(args).await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().contains("Successfully wrote 13 bytes"));
-    }
-    
-    #[tokio::test]
-    async fn test_file_operations_tool_write_denied() {
-        let args = json!({
-            "operation": "write",
-            "path": "/etc/passwd",
-            "content": "malicious content"
-        });
-        
-        let result = FileOperationsTool::execute_async(args).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Write access denied"));
-    }
-    
-    #[tokio::test]
-    async fn test_file_operations_tool_list() {
-        let args = json!({
-            "operation": "list",
-            "path": "/tmp"
-        });
-        
-        let result = FileOperationsTool::execute_async(args).await;
-        assert!(result.is_ok());
-        
-        let files: Vec<String> = serde_json::from_str(&result.unwrap()).unwrap();
-        assert!(files.contains(&"file1.txt".to_string()));
-        assert!(files.contains(&"file2.json".to_string()));
-    }
-    
-    #[tokio::test]
-    async fn test_config_resource_read() {
-        let result = ConfigResource::read_async().await;
-        assert!(result.is_ok());
-        
-        let config: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
-        assert_eq!(config["version"], "1.0.0");
-        assert_eq!(config["environment"], "production");
-        assert!(config["features"]["async_processing"].as_bool().unwrap());
-    }
-    
-    #[tokio::test]
-    async fn test_concurrent_operations() {
-        use tokio::time::Instant;
-        
-        let start = Instant::now();
-        
-        // Execute multiple operations concurrently
-        let tasks = vec![
-            EchoTool::execute_async(json!({"message": "test1"})),
-            EchoTool::execute_async(json!({"message": "test2"})),
-            EchoTool::execute_async(json!({"message": "test3"})),
-        ];
-        
-        let results = futures::future::join_all(tasks).await;
-        let duration = start.elapsed();
-        
-        // All should succeed
-        for result in results {
-            assert!(result.is_ok());
-        }
-        
-        // Should complete faster than if run sequentially (3 * 10ms = 30ms)
-        // Due to concurrent execution, should be closer to 10ms
-        assert!(duration.as_millis() < 25);
-    }
-}

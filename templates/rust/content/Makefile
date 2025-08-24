@@ -16,7 +16,7 @@ check-cargo-component:
 	}
 
 build: check-cargo-component
-	cd handler && cargo component build --release --target wasm32-wasip1
+	cd handler && cargo component build --release --target wasm32-wasip2
 
 test:
 	cd handler && cargo test
@@ -30,7 +30,17 @@ registry-push: build
 	USERNAME=$$(git config user.name | tr '[:upper:]' '[:lower:]' | tr ' ' '-') && \
 	PROJECT={{project-name | snake_case}} && \
 	echo "Pushing ghcr.io/$$USERNAME/$$PROJECT:$$VERSION" && \
-	wkg oci push ghcr.io/$$USERNAME/$$PROJECT:$$VERSION handler/target/wasm32-wasip1/release/$$PROJECT.wasm
+	wkg oci push ghcr.io/$$USERNAME/$$PROJECT:$$VERSION handler/target/wasm32-wasip2/release/$$PROJECT.wasm
 
-up:
-	spin up
+PORT ?= 3004
+
+kill-port:
+	@echo "Killing any process on port $(PORT)..."
+	@lsof -ti:$(PORT) | xargs kill -9 2>/dev/null || true
+	@sleep 1
+
+up: kill-port build
+	@echo "Starting Spin on port $(PORT) in background..."
+	@SPIN_HTTP_LISTEN_ADDR=127.0.0.1:$(PORT) spin up > .spin.log 2>&1 &
+	@sleep 2
+	@echo "Spin started on http://127.0.0.1:$(PORT)/mcp"p
